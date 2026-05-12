@@ -1,0 +1,173 @@
+// ============================================================
+// Friction Stir Processing (FSP) - Moving Circular Pin Tool
+// FreeFEM++ - Adaptive Mesh Animation
+// ============================================================
+
+load "iovtk"
+
+string outdir = "D:\\freefem++\\fsp_circular\\";
+system("mkdir \"D:\\freefem++\\fsp_circular\"");
+
+// Geometry
+real Lx = 5.0;
+real Ly = 2.0;
+real R      = 0.15;
+real margin = 0.35;
+
+// Temperatures
+real Tpeak = 1.0;
+real Tamb  = 0.0;
+
+// Motion
+int Nsteps = 60;
+int Nrot   = 3;
+int Npin   = 60;
+int Nadapt = 3;
+
+// Globals
+real xc  = margin;
+real yc  = Ly / 2.;
+real phi = 0.;
+
+// Borders
+border Rect1(t=0, Lx)   { x=t;    y=0.;   label=1; }
+border Rect2(t=0, Ly)   { x=Lx;   y=t;    label=2; }
+border Rect3(t=0, Lx)   { x=Lx-t; y=Ly;   label=3; }
+border Rect4(t=0, Ly)   { x=0.;   y=Ly-t; label=4; }
+
+border Pin(t=0, 2*pi) {
+    x = xc + R * cos(t);
+    y = yc + R * sin(t);
+    label = 5;
+}
+
+// Initial mesh
+xc  = margin;
+yc  = Ly / 2.;
+phi = 0.;
+
+mesh Th = buildmesh(Rect1(100)+Rect2(40)+Rect3(100)+Rect4(40)+Pin(-Npin));
+
+// PVD header
+{
+    ofstream pvd(outdir + "fsp_circular.pvd");
+    pvd << "<?xml version='1.0'?>"                    << endl;
+    pvd << "<VTKFile type='Collection' version='0.1'>" << endl;
+    pvd << "<Collection>"                              << endl;
+}
+
+cout << "======================================" << endl;
+cout << " FSP Simulation - Circular Pin Tool"   << endl;
+cout << " Plate  : " << Lx << " x " << Ly       << endl;
+cout << " Pin R  : " << R                        << endl;
+cout << " Frames : " << Nsteps                   << endl;
+cout << "======================================" << endl;
+
+// ============================================================
+// ANIMATION LOOP
+// ============================================================
+for (int step = 0; step < Nsteps; step++) {
+
+    // Update pin position and angle
+    xc  = margin + step * (Lx - 2.*margin) / (Nsteps - 1);
+    yc  = Ly / 2.;
+    phi = step * 2.*pi * Nrot / (Nsteps - 1);
+
+    // Rebuild mesh at new pin position
+    Th = buildmesh(Rect1(100)+Rect2(40)+Rect3(100)+Rect4(40)+Pin(-Npin));
+
+    // ---- Adaptive solve loop ----
+    // FE spaces are declared OUTSIDE the iter loop but INSIDE
+    // the step loop so they always match the current Th.
+    // After each adaptmesh call Th changes size, so we re-solve
+    // on the new Th. The final solve uses the finest mesh.
+
+    for (int iter = 0; iter < Nadapt; iter++) {
+
+        // Redefine spaces on current Th every iteration
+        fespace Vhi(Th, P1);
+        Vhi ui, vi;
+        ui = 0;
+
+        solve Temperature(ui, vi, solver=UMFPACK) =
+              int2d(Th)( dx(ui)*dx(vi) + dy(ui)*dy(vi) )
+            + on(5,       ui = Tpeak)
+            + on(1,2,3,4, ui = Tamb )
+            ;
+
+        if (iter < Nadapt - 1) {
+            Th = adaptmesh(Th, ui,
+                           err  = 0.008,
+                           nbvx = 50000,
+                           hmax = Lx / 15.,
+                           hmin = R / 20.);
+        }
+        else {
+            // Final iteration: copy solution to persistent variable
+            // Redefine global spaces on the final settled mesh
+            fespace Vh(Th, P1);
+            fespace Ph(Th, P0);
+            Vh u = ui;
+            Vh v;
+            Ph meshSize, gradMag, pinDist;
+
+            // Derived fields - all computed on the same final Th
+            meshSize = hTriangle;
+            gradMag  = sqrt(dx(u)*dx(u) + dy(u)*dy(u));
+
+            // Signed distance from pin surface
+            // Use Th.nt which now correctly matches Ph dimension
+            int nt = Th.nt;
+            for (int k = 0; k < nt; k++) {
+                real xe = (Th[k][0].x + Th[k][1].x + Th[k][2].x) / 3.;
+                real ye = (Th[k][0].y + Th[k][1].y + Th[k][2].y) / 3.;
+                real rk = sqrt((xe-xc)*(xe-xc) + (ye-yc)*(ye-yc));
+                pinDist[][k] = rk - R;
+            }
+
+            // Console progress
+            cout << "Step " << step+1 << "/" << Nsteps
+                 << "  xc="  << xc
+                 << "  phi=" << phi*180./pi << " deg"
+                 << "  nv="  << Th.nv
+                 << "  nt="  << nt  << endl;
+
+            // VTU filename
+            string num;
+            if      (step <  10) num = "00" + step;
+            else if (step < 100) num = "0"  + step;
+            else                 num = ""   + step;
+
+            int[int] ord = [1, 1, 1, 1];
+            savevtk(outdir + "frame_" + num + ".vtu", Th,
+                    u, gradMag, meshSize, pinDist,
+                    dataname = "Temperature GradMag MeshSize PinDist",
+                    order = ord);
+
+            {
+                ofstream pvd(outdir + "fsp_circular.pvd", append);
+                pvd << "  <DataSet timestep='" << step
+                    << "' file='frame_" << num << ".vtu'/>" << endl;
+            }
+        }
+    }
+
+}
+
+// Close PVD
+{
+    ofstream pvd(outdir + "fsp_circular.pvd", append);
+    pvd << "</Collection>" << endl;
+    pvd << "</VTKFile>"    << endl;
+}
+
+cout << "======================================" << endl;
+cout << " Done. Open fsp_circular.pvd in ParaView" << endl;
+cout << "======================================" << endl;
+cout << " Suggested ParaView workflow:"          << endl;
+cout << " 1. Color by Temperature"               << endl;
+cout << " 2. Color by GradMag"                   << endl;
+cout << " 3. Color by MeshSize"                  << endl;
+cout << " 4. Contour filter on PinDist at 0"     << endl;
+cout << " 5. Press Play for full animation"      << endl;
+cout << "======================================" << endl;
